@@ -4,7 +4,8 @@ import pandas as pd
 import hashlib
 import time
 import re
-from collections import Counter
+import os
+import kagglehub
 from config import POSTGRES, X_BEARER
 
 KEYWORDS = ["kereta cepat whoosh", "whoosh", "kcic"]
@@ -178,18 +179,70 @@ def analyze():
         conn.close()
         return {"error": "No data to analyze."}
 
-    positive_words = ['bagus', 'cepat', 'nyaman', 'canggih', 'modern', 'hebat', 'keren', 'mantap', 'good', 'great', 'amazing', 'excellent']
-    negative_words = ['lambat', 'buruk', 'jelek', 'mahal', 'rugi', 'bad', 'slow', 'expensive', 'poor', 'terrible']
+    positive_words = [
+        "bagus", "cepat", "nyaman", "canggih", "modern", "hebat", "keren",
+        "mantap", "good", "great", "amazing", "excellent", "wow", "asyik",
+        "enak", "murah", "lancar", "top", "puas", "terbaik", "memuaskan",
+        "mantul", "recommended", "oke", "suka", "senang", "happy",
+        "efisien", "ramah", "beres", "kenceng", "responsif"
+    ]
+
+    negative_words = [
+        "lambat", "buruk", "jelek", "mahal", "rugi", "bad", "slow",
+        "expensive", "poor", "terrible", "anjir", "anjing", "goblok",
+        "parah", "macet", "ngebug", "gagal", "kecewa", "mengecewakan",
+        "tolol", "bodoh", "error", "lemot", "bete", "nyebelin", "sampah",
+        "zonk", "anj", "bangsat", "tai", "ngaco", "ngelek", "jelek banget",
+        "aneh", "ironis", "lucu", "katanya", "masa", "malah"
+    ]
+
+    intensifiers = ["banget", "sekali", "parah", "amat", "sangat", "terlalu", "bgt"]
+    negations = ["tidak", "nggak", "gak", "bukan", "tak", "ndak", "ga"]
+    contrastive_words = ["tapi", "namun", "padahal", "meski", "walau"]
+    sarcasm_markers = ["?", "!", "masa", "katanya", "lah", "kok", "malah"]
 
     def simple_sentiment(text):
-        text_lower = text.lower()
-        pos_count = sum(1 for word in positive_words if word in text_lower)
-        neg_count = sum(1 for word in negative_words if word in text_lower)
-        if pos_count > neg_count:
+        text_low = text.lower()
+        words = text_low.split()
+        score = 0
+
+        for i, word in enumerate(words):
+            if word in positive_words:
+                local_score = 0.8
+                if i > 0 and words[i - 1] in negations:
+                    local_score *= -1.5
+                if i + 1 < len(words) and words[i + 1] in intensifiers:
+                    local_score *= 1.4
+                score += local_score
+
+            elif word in negative_words:
+                local_score = -1.5
+                if i > 0 and words[i - 1] in negations:
+                    local_score *= -1.0
+                if i + 1 < len(words) and words[i + 1] in intensifiers:
+                    local_score *= 1.5
+                score += local_score
+
+        # Jika mengandung tanda tanya atau kata seperti "masa", "katanya" bersama kata negatif → sarcasm
+        if any(s in text_low for s in sarcasm_markers) and any(n in text_low for n in negative_words):
+            score -= 1.0
+
+        # Frasa kontras
+        for cword in contrastive_words:
+            if cword in words:
+                after = words[words.index(cword) + 1 :]
+                for w in after:
+                    if w in positive_words:
+                        score += 0.5
+                    elif w in negative_words:
+                        score -= 1.0
+
+        if score > 0.5:
             return "positive"
-        elif neg_count > pos_count:
+        elif score < -0.3:
             return "negative"
-        return "neutral"
+        else:
+            return "neutral"
 
     df["sentiment"] = df["text_clean"].apply(simple_sentiment)
 
@@ -222,3 +275,69 @@ def analyze():
     summary = df["sentiment"].value_counts().to_dict()
     conn.close()
     return summary
+
+
+
+
+# ==================== Load Kaggle Dataset ====================
+def load_kaggle_data():
+    import os
+    import kagglehub
+    import pandas as pd
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # Pastikan tabel sudah siap
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kaggle_whoosh (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMP,
+            text TEXT,
+            sentiment VARCHAR(20),
+            lang VARCHAR(10)
+        );
+        """)
+        conn.commit()
+
+        # Unduh dataset dari Kaggle
+        dataset_path = kagglehub.dataset_download("gevabriel/whoosh")
+
+        # Cari file CSV dalam folder dataset
+        csv_files = [f for f in os.listdir(dataset_path) if f.endswith(".csv")]
+        if not csv_files:
+            raise FileNotFoundError("No CSV file found in Kaggle dataset folder.")
+
+        file_path = os.path.join(dataset_path, csv_files[0])
+        df = pd.read_csv(file_path)
+
+        # Pastikan kolom "tweet" dan "sentiment" ada
+        if "tweet" not in df.columns or "sentiment" not in df.columns:
+            raise ValueError(f"Dataset must contain 'tweet' and 'sentiment' columns. Found columns: {df.columns.tolist()}")
+
+        # Rename agar seragam dengan pipeline kita
+        df.rename(columns={"tweet": "text"}, inplace=True)
+
+        # Tambahkan kolom pendukung jika belum ada
+        if "created_at" not in df.columns:
+            df["created_at"] = pd.Timestamp.now()
+        if "lang" not in df.columns:
+            df["lang"] = "id"
+
+        # Masukkan ke PostgreSQL
+        for _, row in df.iterrows():
+            cur.execute("""
+                INSERT INTO kaggle_whoosh (created_at, text, sentiment, lang)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT DO NOTHING;
+            """, (row["created_at"], row["text"], row["sentiment"], row["lang"]))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return f"Successfully loaded {len(df)} Kaggle rows into database."
+
+    except Exception as e:
+        return f"Failed to load dataset: {e}"
